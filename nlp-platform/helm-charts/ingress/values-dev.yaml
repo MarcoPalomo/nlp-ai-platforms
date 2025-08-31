@@ -1,0 +1,44 @@
+# ===========================================
+# Ingress Configuration
+# ===========================================
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  
+  hosts:
+    - host: api.your-domain.com
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: nlp-api
+              port: 8000
+    - host: mistral.your-domain.com
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: mistral-server
+              port: 8001
+    - host: torchserve.your-domain.com
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: torchserve
+              port: 8080
+
+  tls:
+    - secretName: wildcard-cert
+      hosts:
+        - api.your-domain.com
+        - mistral.your-domain.com
+        - torchserve.your-domain.com

@@ -1,0 +1,24 @@
+{{- if .Values.certManager.clusterIssuer.enabled }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.certManager.clusterIssuer.name }}
+  labels:
+    {{- include "nlp-ingress.labels" . | nindent 4 }}
+spec:
+  acme:
+    server: {{ .Values.certManager.clusterIssuer.server }}
+    email: {{ .Values.certManager.clusterIssuer.email }}
+    privateKeySecretRef:
+      name: {{ .Values.certManager.clusterIssuer.privateKeySecretRef.name }}
+    solvers:
+      {{- range .Values.certManager.clusterIssuer.solvers }}
+      - http01:
+          ingress:
+            class: {{ .http01.ingress.class }}
+        {{- if .selector }}
+        selector:
+          {{- toYaml .selector | nindent 10 }}
+        {{- end }}
+      {{- end }}
+{{- end }}

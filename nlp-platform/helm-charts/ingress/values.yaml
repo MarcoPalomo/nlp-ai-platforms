@@ -1,0 +1,230 @@
+# ===========================================
+# Configuration Ingress pour NLP Platform
+# ===========================================
+
+ingress:
+  enabled: true
+  className: "nginx"
+  
+  # Annotations globales pour tous les services
+  annotations:
+    # Routing et réécriture
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    
+    # Taille et timeouts pour ML workloads
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"  # Augmenté pour gros modèles
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    
+    # SSL et certificats
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Sécurité
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    nginx.ingress.kubernetes.io/client-header-buffer-size: "64k"
+    nginx.ingress.kubernetes.io/large-client-header-buffers: "4 64k"
+    
+    # Rate limiting (protection DDoS)
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/rate-limit-connections: "10"
+    
+    # CORS pour les applications web
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS, PUT, DELETE"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+
+  # Configuration des hôtes et services
+  hosts:
+    # API Gateway principal - Point d'entrée unique recommandé
+    - host: api.your-domain.com
+      paths:
+        # Route principale de l'API
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: nlp-api-service
+              port: 8000
+        
+        # Routes spécifiques pour debugging/admin (optionnel)
+        - path: /admin/torchserve(/|$)(.*)
+          pathType: ImplementationSpecific
+          backend:
+            service:
+              name: torchserve-service
+              port: 8080
+          annotations:
+            nginx.ingress.kubernetes.io/rewrite-target: /$2
+            nginx.ingress.kubernetes.io/auth-basic: "Authentication Required"
+            nginx.ingress.kubernetes.io/auth-secret: "basic-auth-secret"
+        
+        - path: /admin/mistral(/|$)(.*)
+          pathType: ImplementationSpecific
+          backend:
+            service:
+              name: mistral-server-service
+              port: 8001
+          annotations:
+            nginx.ingress.kubernetes.io/rewrite-target: /$2
+            nginx.ingress.kubernetes.io/auth-basic: "Authentication Required"
+            nginx.ingress.kubernetes.io/auth-secret: "basic-auth-secret"
+
+    # Services directs (pour développement/debugging uniquement)
+    # ⚠️ En production, privilégiez l'API Gateway
+    - host: mistral.your-domain.com
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: mistral-server-service
+              port: 8001
+      # Annotations spécifiques pour Mistral
+      annotations:
+        nginx.ingress.kubernetes.io/proxy-read-timeout: "600"  # Timeout plus long pour la génération
+        nginx.ingress.kubernetes.io/rate-limit: "20"  # Rate limiting plus strict
+        nginx.ingress.kubernetes.io/auth-basic: "Authentication Required"
+        nginx.ingress.kubernetes.io/auth-secret: "mistral-auth-secret"
+
+    - host: torchserve.your-domain.com
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: torchserve-service
+              port: 8080
+      # Annotations spécifiques pour TorchServe
+      annotations:
+        nginx.ingress.kubernetes.io/proxy-read-timeout: "180"  # Timeout pour l'inférence
+        nginx.ingress.kubernetes.io/rate-limit: "50"
+        nginx.ingress.kubernetes.io/auth-basic: "Authentication Required"
+        nginx.ingress.kubernetes.io/auth-secret: "torchserve-auth-secret"
+
+  # Configuration TLS/SSL
+  tls:
+    - secretName: nlp-platform-tls
+      hosts:
+        - api.your-domain.com
+        - mistral.your-domain.com
+        - torchserve.your-domain.com
+    
+    # Certificat séparé pour différents domaines si nécessaire
+    # - secretName: admin-tls
+    #   hosts:
+    #     - admin.your-domain.com
+
+# ===========================================
+# Configuration avancée par environnement
+# ===========================================
+
+# Environnement de développement
+dev:
+  ingress:
+    hosts:
+      - host: api-dev.your-domain.com
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nlp-api-service
+                port: 8000
+    annotations:
+      nginx.ingress.kubernetes.io/rate-limit: "1000"  # Pas de limite en dev
+      nginx.ingress.kubernetes.io/auth-basic: ""  # Pas d'auth en dev
+    tls:
+      - secretName: dev-tls
+        hosts:
+          - api-dev.your-domain.com
+
+# Environnement de staging
+staging:
+  ingress:
+    hosts:
+      - host: api-staging.your-domain.com
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nlp-api-service
+                port: 8000
+    annotations:
+      nginx.ingress.kubernetes.io/rate-limit: "200"
+      nginx.ingress.kubernetes.io/auth-basic: "Staging Access"
+      nginx.ingress.kubernetes.io/auth-secret: "staging-auth-secret"
+    tls:
+      - secretName: staging-tls
+        hosts:
+          - api-staging.your-domain.com
+
+# ===========================================
+# Monitoring et logs
+# ===========================================
+
+monitoring:
+  # Logs d'accès détaillés
+  nginxConfig:
+    log-format-upstream: >-
+      $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent
+      "$http_referer" "$http_user_agent" $request_length $request_time
+      [$proxy_upstream_name] [$proxy_alternative_upstream_name] $upstream_addr
+      $upstream_response_length $upstream_response_time $upstream_status $req_id
+  
+  # Métriques Prometheus
+  serviceMonitor:
+    enabled: true
+    namespace: monitoring
+    endpoints:
+      - port: metrics
+        interval: 30s
+        path: /metrics
+
+# ===========================================
+# Sécurité avancée
+# ===========================================
+
+security:
+  # WAF (Web Application Firewall)
+  modsecurity:
+    enabled: true
+    config: |
+      SecRuleEngine On
+      SecRequestBodyAccess On
+      SecRule REQUEST_HEADERS:Content-Type "text/xml" \
+        "id:'200001',phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML"
+  
+  # Whitelist IP (si nécessaire)
+  allowedIPs:
+    enabled: false
+    cidrs:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+# ===========================================
+# Configuration réseau
+# ===========================================
+
+network:
+  # IPv6 support
+  ipv6:
+    enabled: false
+  
+  # Load balancing
+  loadBalancer:
+    algorithm: "round_robin"  # round_robin, least_conn, ip_hash
+  
+  # Session affinity si nécessaire
+  sessionAffinity:
+    enabled: false
+    cookieName: "nlp-session"
+    expires: 86400

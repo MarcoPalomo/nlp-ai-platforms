@@ -1,0 +1,647 @@
+stages:
+  - validate
+  - build
+  - test
+  - security
+  - push
+  - deploy
+  - verify
+
+variables:
+  # Docker configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_BUILDKIT: 1
+  
+  # Image versioning
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  LATEST_TAG: latest
+  
+  # Kubernetes configuration
+  KUBE_CONTEXT: production
+  KUBE_NAMESPACE: nlp-platform
+  
+  # Registry configuration
+  REGISTRY_URL: $CI_REGISTRY_IMAGE
+  
+  # Helm configuration
+  HELM_TIMEOUT: "600s"
+  HELM_ATOMIC: "true"
+
+# ===========================================
+# Templates pour réutilisation
+# ===========================================
+
+.docker_template: &docker_template
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+.kubectl_template: &kubectl_template
+  image: bitnami/kubectl:latest
+  before_script:
+    - echo "$KUBECONFIG_CONTENT" | base64 -d > kubeconfig
+    - export KUBECONFIG=$PWD/kubeconfig
+    - kubectl config use-context $KUBE_CONTEXT
+
+.helm_template: &helm_template
+  image: alpine/helm:3.13.2
+  before_script:
+    - echo "$KUBECONFIG_CONTENT" | base64 -d > kubeconfig
+    - export KUBECONFIG=$PWD/kubeconfig
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm repo add jetstack https://charts.jetstack.io
+    - helm repo update
+
+# ===========================================
+# Stage 1: Validation
+# ===========================================
+
+lint_code:
+  stage: validate
+  image: python:3.11-slim
+  script:
+    - pip install flake8 black mypy
+    - black --check api/
+    - flake8 api/
+    - mypy api/ --ignore-missing-imports
+  only:
+    changes:
+      - api/**/*
+
+validate_helm:
+  stage: validate
+  <<: *helm_template
+  script:
+    - helm lint helm-charts/api/
+    - helm lint helm-charts/ingress/
+    - helm lint helm-charts/mistral-server/
+    - helm lint helm-charts/torchserve/
+    # Template validation
+    - helm template test-api helm-charts/api/ --debug --dry-run
+    - helm template test-ingress helm-charts/ingress/ --debug --dry-run
+  only:
+    changes:
+      - helm-charts/**/*
+
+validate_k8s:
+  stage: validate
+  image: cytopia/kubeval:latest
+  script:
+    - kubeval k8s-manifests/*.yaml
+  only:
+    changes:
+      - k8s-manifests/**/*
+
+# ===========================================
+# Stage 2: Build Docker images
+# ===========================================
+
+build_api:
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --build-arg VERSION=$IMAGE_TAG \
+        --cache-from $REGISTRY_URL/api:$LATEST_TAG \
+        -t $REGISTRY_URL/api:$IMAGE_TAG \
+        -t $REGISTRY_URL/api:$LATEST_TAG \
+        api/
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    changes:
+      - api/**/*
+      - requirements.txt
+
+build_mistral:
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --cache-from $REGISTRY_URL/mistral-server:$LATEST_TAG \
+        -t $REGISTRY_URL/mistral-server:$IMAGE_TAG \
+        -t $REGISTRY_URL/mistral-server:$LATEST_TAG \
+        mistral-server/docker/
+  only:
+    changes:
+      - mistral-server/**/*
+
+build_torchserve:
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --cache-from $REGISTRY_URL/torchserve:$LATEST_TAG \
+        -t $REGISTRY_URL/torchserve:$IMAGE_TAG \
+        -t $REGISTRY_URL/torchserve:$LATEST_TAG \
+        models/torchserve/
+  only:
+    changes:
+      - models/torchserve/**/*
+
+# ===========================================
+# Stage 3: Tests
+# ===========================================
+
+test_api:
+  stage: test
+  image: python:3.11-slim
+  services:
+    - name: $REGISTRY_URL/api:$IMAGE_TAG
+      alias: api-test
+  variables:
+    API_URL: http://api-test:8000
+  script:
+    - pip install pytest requests
+    - pytest tests/api_tests.py -v
+  coverage: '/TOTAL.+ ([0-9]{1,3}%)/'
+  artifacts:
+    reports:
+      junit: tests/report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: tests/coverage.xml
+  needs:
+    - build_api
+  only:
+    changes:
+      - api/**/*
+      - tests/**/*
+
+integration_tests:
+  stage: test
+  <<: *docker_template
+  script:
+    - docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
+    - docker-compose -f docker-compose.test.yml down
+  artifacts:
+    reports:
+      junit: tests/integration/report.xml
+  needs:
+    - build_api
+    - build_mistral
+    - build_torchserve
+
+# ===========================================
+# Stage 4: Security Scanning
+# ===========================================
+
+security_scan:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format template --template "@contrib/sarif.tpl" -o trivy-results.sarif $REGISTRY_URL/api:$IMAGE_TAG
+    - trivy image --exit-code 1 --severity CRITICAL $REGISTRY_URL/api:$IMAGE_TAG
+  artifacts:
+    reports:
+      sast: trivy-results.sarif
+  needs:
+    - build_api
+  allow_failure: true
+
+# ===========================================
+# Stage 5: Push images
+# ===========================================
+
+push_images:
+  stage: push
+  <<: *docker_template
+  script:
+    - docker push $REGISTRY_URL/api:$IMAGE_TAG
+    - docker push $REGISTRY_URL/api:$LATEST_TAG
+    - docker push $REGISTRY_URL/mistral-server:$IMAGE_TAG
+    - docker push $REGISTRY_URL/mistral-server:$LATEST_TAG
+    - docker push $REGISTRY_URL/torchserve:$IMAGE_TAG
+    - docker push $REGISTRY_URL/torchserve:$LATEST_TAG
+  needs:
+    - build_api
+    - build_mistral
+    - build_torchserve
+    - test_api
+  only:
+    - main
+
+# ===========================================
+# Stage 6: Deploy Infrastructure
+# ===========================================
+
+deploy_namespace:
+  stage: deploy
+  <<: *kubectl_template
+  script:
+    - kubectl apply -f k8s-manifests/namespaces.yaml
+    - kubectl apply -f k8s-manifests/secrets.yaml
+    - kubectl apply -f k8s-manifests/configmaps.yaml
+  only:
+    - main
+  when: manual
+
+deploy_ingress:
+  stage: deploy
+  <<: *helm_template
+  script:
+    # Deployer cert-manager si nécessaire
+    - |
+      if ! helm list -A | grep cert-manager; then
+        helm repo add jetstack https://charts.jetstack.io
+        helm install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --set installCRDs=true \
+          --wait
+      fi
+    
+    # Deployer l'ingress
+    - |
+      helm upgrade --install nlp-ingress ./helm-charts/ingress \
+        --namespace $KUBE_NAMESPACE \
+        --create-namespace \
+        --timeout $HELM_TIMEOUT \
+        --atomic=$HELM_ATOMIC \
+        --wait \
+        -f helm-charts/ingress/values.yaml
+  needs:
+    - deploy_namespace
+  only:
+    - main
+
+# ===========================================
+# Stage 7: Deploy Applications
+# ===========================================
+
+deploy_torchserve:
+  stage: deploy
+  <<: *helm_template
+  script:
+    - |
+      helm upgrade --install torchserve ./helm-charts/torchserve \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/torchserve \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic=$HELM_ATOMIC \
+        --wait \
+        -f helm-charts/torchserve/values.yaml
+  needs:
+    - push_images
+    - deploy_ingress
+  only:
+    - main
+
+deploy_mistral:
+  stage: deploy
+  <<: *helm_template
+  script:
+    - |
+      helm upgrade --install mistral-server ./helm-charts/mistral-server \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/mistral-server \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic=$HELM_ATOMIC \
+        --wait \
+        -f helm-charts/mistral-server/values.yaml
+  needs:
+    - push_images
+    - deploy_ingress
+    - deploy_torchserve
+  only:
+    - main
+
+deploy_api:
+  stage: deploy
+  <<: *helm_template
+  script:
+    - |
+      helm upgrade --install nlp-api ./helm-charts/api \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/api \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic=$HELM_ATOMIC \
+        --wait \
+        -f helm-charts/api/values.yaml
+  needs:
+    - push_images
+    - deploy_mistral
+  only:
+    - main
+
+
+verify_deployment:
+  stage: verify
+  <<: *kubectl_template
+  script:
+    # Vérifier que tous les pods sont prêts
+    - kubectl wait --for=condition=ready pod -l app.kubernetes.io/part-of=nlp-platform -n $KUBE_NAMESPACE --timeout=300s
+    
+    # Vérifier les services
+    - kubectl get services -n $KUBE_NAMESPACE
+    - kubectl get ingress -n $KUBE_NAMESPACE
+    
+    # Health checks
+    - |
+      API_URL=$(kubectl get ingress nlp-ingress -n $KUBE_NAMESPACE -o jsonpath='{.spec.rules[0].host}')
+      echo "Testing API at https://$API_URL"
+      
+      # Attendre que l'ingress soit prêt
+      sleep 30
+      
+      # Test health endpoint
+      curl -f https://$API_URL/health || exit 1
+      
+      # Test basic functionality
+      curl -f -X POST https://$API_URL/nlp/chat \
+        -H "Content-Type: application/json" \
+        -d '{"prompt": "Hello test"}' || exit 1
+      
+      echo "✅ All health checks passed!"
+  artifacts:
+    reports:
+      junit: tests/deployment-report.xml
+  needs:
+    - deploy_api
+  only:
+    - main
+
+smoke_tests:
+  stage: verify
+  image: postman/newman:alpine
+  script:
+    - |
+      API_URL=$(kubectl get ingress nlp-ingress -n $KUBE_NAMESPACE -o jsonpath='{.spec.rules[0].host}')
+      newman run tests/postman/nlp-api-tests.json \
+        --env-var "api_url=https://$API_URL" \
+        --reporters cli,junit \
+        --reporter-junit-export newman-report.xml
+  artifacts:
+    reports:
+      junit: newman-report.xml
+  needs:
+    - verify_deployment
+  allow_failure: true
+
+
+deploy_staging:
+  stage: deploy
+  <<: *helm_template
+  variables:
+    KUBE_CONTEXT: staging
+    KUBE_NAMESPACE: nlp-platform-staging
+  script:
+    - |
+      helm upgrade --install nlp-api-staging ./helm-charts/api \
+        --namespace $KUBE_NAMESPACE \
+        --create-namespace \
+        --set image.repository=$REGISTRY_URL/api \
+        --set image.tag=$IMAGE_TAG \
+        --set global.environment=staging \
+        --timeout $HELM_TIMEOUT \
+        --atomic=$HELM_ATOMIC \
+        -f helm-charts/api/values-staging.yaml
+  environment:
+    name: staging
+    url: https://api-staging.nlp-platform.com
+  only:
+    - develop
+  when: manual
+
+# ===========================================
+# Rollback en cas de problème
+# ===========================================
+
+rollback_production:
+  stage: deploy
+  <<: *helm_template
+  script:
+    - helm rollback nlp-api -n $KUBE_NAMESPACE
+    - helm rollback mistral-server -n $KUBE_NAMESPACE
+    - helm rollback torchserve -n $KUBE_NAMESPACE
+    - kubectl rollout status deployment -n $KUBE_NAMESPACE
+  when: manual
+  only:
+    - main
+
+# ===========================================
+# Cleanup des anciennes images
+# ===========================================
+
+cleanup_registry:
+  stage: verify
+  image: alpine/curl:latest
+  script:
+    - |
+      # Garder seulement les 10 dernières images
+      echo "Cleaning up old images..."
+      # Script de nettoyage via API GitLab Registry
+      # (À adapter selon votre registry)
+  when: manual
+  only:
+    - main
+
+
+# Build seulement si les fichiers ont changé
+.build_conditional:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - api/**/*
+        - helm-charts/**/*
+        - k8s-manifests/**/*
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes:
+        - api/**/*
+      when: manual
+
+# Deploy seulement sur main
+.deploy_rules:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+
+# Rebuild API seulement si nécessaire
+build_api:
+  extends: .build_conditional
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --build-arg VERSION=$IMAGE_TAG \
+        --cache-from $REGISTRY_URL/api:$LATEST_TAG \
+        --tag $REGISTRY_URL/api:$IMAGE_TAG \
+        --tag $REGISTRY_URL/api:$LATEST_TAG \
+        api/
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - build.env
+
+# Pareil pour les autres services...
+build_mistral:
+  extends: .build_conditional
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --cache-from $REGISTRY_URL/mistral-server:$LATEST_TAG \
+        --tag $REGISTRY_URL/mistral-server:$IMAGE_TAG \
+        --tag $REGISTRY_URL/mistral-server:$LATEST_TAG \
+        mistral-server/docker/
+
+build_torchserve:
+  extends: .build_conditional
+  stage: build
+  <<: *docker_template
+  script:
+    - |
+      docker build \
+        --cache-from $REGISTRY_URL/torchserve:$LATEST_TAG \
+        --tag $REGISTRY_URL/torchserve:$IMAGE_TAG \
+        --tag $REGISTRY_URL/torchserve:$LATEST_TAG \
+        models/torchserve/
+
+
+push_images:
+  stage: push
+  <<: *docker_template
+  script:
+    - |
+      # Push avec retry
+      for i in {1..3}; do
+        echo "Push attempt $i/3..."
+        if docker push $REGISTRY_URL/api:$IMAGE_TAG && \
+           docker push $REGISTRY_URL/api:$LATEST_TAG && \
+           docker push $REGISTRY_URL/mistral-server:$IMAGE_TAG && \
+           docker push $REGISTRY_URL/mistral-server:$LATEST_TAG && \
+           docker push $REGISTRY_URL/torchserve:$IMAGE_TAG && \
+           docker push $REGISTRY_URL/torchserve:$LATEST_TAG; then
+          echo "✅ All images pushed successfully!"
+          break
+        else
+          echo "❌ Push failed, retrying in 10s..."
+          sleep 10
+        fi
+        if [ $i -eq 3 ]; then
+          echo "❌ Push failed after 3 attempts"
+          exit 1
+        fi
+      done
+  needs:
+    - build_api
+    - build_mistral
+    - build_torchserve
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+
+deploy_production:
+  stage: deploy
+  <<: *helm_template
+  script:
+    - kubectl create namespace $KUBE_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+    
+    # 2. k8s manifests
+    - kubectl apply -f k8s-manifests/ -n $KUBE_NAMESPACE
+    
+    # 3. Infrastructure → Services → API
+    - |
+      echo "🚀 Deploying infrastructure..."
+      helm upgrade --install nlp-ingress ./helm-charts/ingress \
+        --namespace $KUBE_NAMESPACE \
+        --timeout $HELM_TIMEOUT \
+        --atomic \
+        --wait \
+        -f helm-charts/ingress/values.yaml
+    
+    - |
+      echo "🤖 Deploying TorchServe..."
+      helm upgrade --install torchserve ./helm-charts/torchserve \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/torchserve \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic \
+        --wait \
+        -f helm-charts/torchserve/values.yaml
+    
+    - |
+      echo "🧠 Deploying Mistral..."
+      helm upgrade --install mistral-server ./helm-charts/mistral-server \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/mistral-server \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic \
+        --wait \
+        -f helm-charts/mistral-server/values.yaml
+    
+    - |
+      echo "🌐 Deploying API Gateway..."
+      helm upgrade --install nlp-api ./helm-charts/api \
+        --namespace $KUBE_NAMESPACE \
+        --set image.repository=$REGISTRY_URL/api \
+        --set image.tag=$IMAGE_TAG \
+        --timeout $HELM_TIMEOUT \
+        --atomic \
+        --wait \
+        -f helm-charts/api/values.yaml
+    
+    
+    - kubectl apply -f k8s-manifests/hpa.yaml -n $KUBE_NAMESPACE
+    
+    - echo "✅ Deployment completed successfully!"
+  environment:
+    name: production
+    url: https://api.your-domain.com
+    deployment_tier: production
+  needs:
+    - push_images
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ===========================================
+# Post-deploy verification
+# ===========================================
+
+post_deploy_health_check:
+  stage: verify
+  image: curlimages/curl:latest
+  script:
+    - sleep 60  
+    - |
+      echo "🔍 Running post-deployment health checks..."
+      
+      # Test API Gateway
+      curl -f https://api.your-domain.com/health
+      echo "✅ API Gateway healthy"
+      
+      # Test fonctionnel
+      curl -f -X POST https://api.your-domain.com/nlp/chat \
+        -H "Content-Type: application/json" \
+        -d '{"prompt": "Hello from GitOps!"}'
+      echo "✅ Chat endpoint working"
+      
+      echo "🎉 All systems operational!"
+  needs:
+    - deploy_production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: nlp-api
+description: A Helm chart for NLP API Gateway
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+keywords:
+  - nlp
+  - fastapi
+  - machine-learning
+  - api-gateway
+
+home: https://github.com/your-org/nlp-platform
+sources:
+  - https://github.com/your-org/nlp-platform
+
+maintainers:
+  - name: Ludovic Marco
+    email: your.email@company.com

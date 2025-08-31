@@ -1,0 +1,33 @@
+---
+{{- if and (eq .Values.ingress.className "traefik") .Values.middleware.enabled }}
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "nlp-ingress.fullname" . }}-ratelimit
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nlp-ingress.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    burst: {{ .Values.middleware.rateLimit.burst }}
+    average: {{ .Values.middleware.rateLimit.average }}
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "nlp-ingress.fullname" . }}-headers
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nlp-ingress.labels" . | nindent 4 }}
+spec:
+  headers:
+    customRequestHeaders:
+      X-Forwarded-Proto: "https"
+    customResponseHeaders:
+      X-Content-Type-Options: "nosniff"
+      X-Frame-Options: "DENY"
+      X-XSS-Protection: "1; mode=block"
+    sslRedirect: true
+{{- end }}
+
+---
