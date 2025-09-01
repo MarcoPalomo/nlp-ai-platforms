@@ -1,0 +1,14 @@
+environment: prod
+
+api:
+  replicas: 3
+  debug: false
+
+torchserve:
+  resources:
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+
+monitoring:
+  alerts_enabled: true

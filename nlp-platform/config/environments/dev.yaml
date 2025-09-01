@@ -1,0 +1,11 @@
+environment: dev
+
+api:
+  replicas: 1
+  debug: true
+
+torchserve:
+  resources:
+    limits:
+      cpu: "1"
+      memory: "2Gi"
