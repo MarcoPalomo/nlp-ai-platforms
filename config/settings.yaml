@@ -1,0 +1,21 @@
+app:
+  name: nlp-platform-mistral
+  version: "1.0.0"
+
+logging:
+  level: INFO
+  format: "[%(asctime)s] %(levelname)s in %(module)s: %(message)s"
+
+monitoring:
+  enabled: true
+  prometheus_url: ${PROMETHEUS_URL}
+  grafana_url: ${GRAFANA_URL}
+
+torchserve:
+  host: ${TORCHSERVE_HOST}
+  port: ${TORCHSERVE_PORT}
+  model_store: /app/model-store
+
+mistral:
+  config: ${MISTRAL_CONFIG_PATH}
+  default_model: mistral-7b-instruct

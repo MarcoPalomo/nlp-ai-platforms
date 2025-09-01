@@ -1,0 +1,331 @@
+# Réplication : 1 seul replica pour les modèles LLM
+replicaCount: 1  # Correct pour éviter le partage de GPU/modèles
+
+image:
+  repository: your-dockerhub-user/mistral-server
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Configuration du service
+service:
+  type: ClusterIP
+  port: 8001
+  targetPort: 8001
+  annotations: {}
+
+# Ressources adaptées aux LLM
+resources:
+  requests:
+    cpu: 1000m        # Augmenté : LLM consomme beaucoup de CPU
+    memory: 6Gi       # Augmenté : modèles 7B+ nécessitent plus de RAM
+    # nvidia.com/gpu: 1  # Décommentez si GPU disponible
+  limits:
+    cpu: 4000m        # Augmenté pour les pics de charge
+    memory: 12Gi      # Augmenté : évite les OOM avec gros modèles
+    # nvidia.com/gpu: 1  # Décommentez si GPU disponible
+
+# Autoscaling : DÉSACTIVÉ pour les LLM (normal)
+autoscaling:
+  enabled: false      # Correct : Les LLM ne scale pas horizontalement facilement
+  minReplicas: 1
+  maxReplicas: 3      # Réduit : coûteux en ressources
+  targetCPUUtilizationPercentage: 60  # Réduit pour éviter la latence
+  targetMemoryUtilizationPercentage: 70
+
+# Health checks adaptés aux LLM
+healthChecks:
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8001
+    initialDelaySeconds: 120    # Augmenté : chargement du modèle long
+    periodSeconds: 30          # Augmenté : évite le spam
+    timeoutSeconds: 10         # Augmenté
+    failureThreshold: 5        # Plus tolérant
+    successThreshold: 1
+  
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8001
+    initialDelaySeconds: 60     # Augmenté : temps de chargement
+    periodSeconds: 15          # Fréquence raisonnable
+    timeoutSeconds: 10         # Timeout plus long
+    failureThreshold: 5        # Plus tolérant pendant le démarrage
+    successThreshold: 1
+
+  # Startup probe pour le chargement initial du modèle
+  startupProbe:
+    httpGet:
+      path: /health
+      port: 8001
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 30       # 5 minutes max pour charger le modèle
+    successThreshold: 1
+
+# Variables d'environnement
+env:
+  - name: ENV
+    value: "production"
+  - name: MODEL_PATH
+    value: "/models/mistral"
+  - name: API_PORT
+    value: "8001"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: WORKERS
+    value: "1"                 # 1 seul worker pour éviter les conflits GPU/modèle
+  - name: MAX_TOKENS
+    value: "2048"
+  - name: TEMPERATURE
+    value: "0.7"
+  - name: GPU_MEMORY_FRACTION
+    value: "0.9"               # Si GPU disponible
+  # Optimisations mémoire
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: "max_split_size_mb:512"
+  - name: TOKENIZERS_PARALLELISM
+    value: "false"             # Évite les warnings
+
+envFrom:
+  - configMapRef:
+      name: mistral-server-config
+  - secretRef:
+      name: mistral-server-secrets
+
+# Persistence OBLIGATOIRE pour les modèles LLM
+persistence:
+  enabled: true               # CRITIQUE : Évite de retélécharger le modèle
+  size: 50Gi                 # Augmenté : modèles 7B+ font ~20-30Gi
+  storageClass: "fast-ssd"   # SSD recommandé pour les performances
+  accessMode: ReadWriteOnce
+  mountPath: /models
+  annotations:
+    volume.beta.kubernetes.io/storage-class: "fast-ssd"
+
+# Volume temporaire pour cache et logs
+tempVolumes:
+  - name: tmp-volume
+    emptyDir:
+      sizeLimit: 2Gi
+    mountPath: /tmp
+  - name: cache-volume
+    emptyDir:
+      sizeLimit: 5Gi          # Cache pour tokenizer, etc.
+    mountPath: /app/cache
+  - name: shm-volume
+    emptyDir:
+      medium: Memory
+      sizeLimit: 2Gi          # Shared memory pour PyTorch
+    mountPath: /dev/shm
+
+# Security context adapté
+securityContext:
+  # Pod security context
+  runAsUser: 1000
+  runAsGroup: 1000
+  runAsNonRoot: true
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+  
+  # Container security context
+  container:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    capabilities:
+      drop: ["ALL"]
+      add: ["NET_BIND_SERVICE"]  # Pour bind sur le port 8001
+
+# Disruption budget adapté aux LLM
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 0           # Changé : Permet les mises à jour avec 1 replica
+  # maxUnavailable: 1       # Alternative
+
+# Affinity : Préférer les nœuds avec GPU
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: node-type
+              operator: In
+              values:
+                - gpu-node
+            - key: accelerator
+              operator: In
+              values:
+                - nvidia-tesla-v100
+                - nvidia-a100
+  
+  # Anti-affinity : Éviter de placer plusieurs instances Mistral sur le même nœud
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - mistral-server
+          topologyKey: kubernetes.io/hostname
+
+# Tolérations pour nœuds GPU
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  - key: "gpu-workload"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+
+# Sélecteur de nœuds
+nodeSelector:
+  # accelerator: nvidia-tesla-v100  # Décommentez si vous avez des GPU spécifiques
+  # node-type: gpu-node
+
+# Configuration spécifique aux modèles
+model:
+  name: "mistral-7b-instruct"
+  quantization: "none"        # none, int8, int4
+  maxConcurrentRequests: 4    # Limite les requêtes simultanées
+  maxBatchSize: 8
+  maxSequenceLength: 2048
+  cacheSize: "2Gi"           # Cache du modèle en mémoire
+
+# Configuration GPU (si disponible)
+gpu:
+  enabled: false             # Activez si vous avez des GPU
+  count: 1
+  type: "nvidia-tesla-v100"
+  memoryFraction: 0.9
+  
+  # Configuration CUDA
+  cuda:
+    version: "11.8"
+    runtime: "nvidia"
+
+# Monitoring spécifique aux LLM
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    path: /metrics
+  
+  # Métriques personnalisées
+  metrics:
+    - name: model_load_time
+      type: histogram
+    - name: inference_duration
+      type: histogram
+    - name: tokens_per_second
+      type: gauge
+    - name: gpu_memory_usage
+      type: gauge
+
+# Configuration réseau pour les gros modèles
+networking:
+  # Timeout plus longs pour l'inférence
+  timeouts:
+    server: 300s
+    client: 300s
+    connect: 60s
+  
+  # Taille des buffers
+  buffers:
+    request: "100m"
+    response: "100m"
+
+# Configuration de déploiement
+deployment:
+  strategy:
+    type: Recreate          # Changé : Rolling update problématique avec 1 replica + GPU
+    # type: RollingUpdate
+    # rollingUpdate:
+    #   maxSurge: 0
+    #   maxUnavailable: 1
+  
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+  
+  labels:
+    component: "llm-server"
+    model: "mistral-7b"
+
+# Configuration pour différents environnements
+environments:
+  development:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+      limits:
+        cpu: 2000m
+        memory: 8Gi
+    model:
+      quantization: "int8"    # Quantization pour économiser la mémoire en dev
+  
+  staging:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 1000m
+        memory: 8Gi
+      limits:
+        cpu: 3000m
+        memory: 16Gi
+  
+  production:
+    replicaCount: 1           # Garde 1 en prod aussi
+    resources:
+      requests:
+        cpu: 2000m
+        memory: 12Gi
+      limits:
+        cpu: 4000m
+        memory: 24Gi       # Augmenté pour les gros modèles
+
+# Configuration des volumes pour optimiser les performances
+volumeOptimizations:
+  # Cache du modèle sur SSD local si disponible
+  localSSD:
+    enabled: false
+    path: /mnt/local-ssd/models
+    size: 100Gi
+  
+  # Memory-mapped files pour les modèles
+  hugepages:
+    enabled: false
+    size: "2Mi"
+    limit: "4Gi"
+
+# Tests de déploiement
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: latest
+  
+  # Tests spécifiques aux LLM
+  healthCheck:
+    timeout: 60s
+    retries: 5
+  
+  inference:
+    timeout: 120s           # Test d'inférence peut être long
+    prompt: "Hello, this is a test."
+    expectedTokens: 10
+
+global:
+  namespace: monitoring 

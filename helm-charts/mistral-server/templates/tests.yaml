@@ -1,0 +1,30 @@
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "mistral-server.fullname" . }}-test"
+  labels:
+    {{- include "mistral-server.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: health-test
+      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}"
+      command: ["sh", "-c"]
+      args:
+        - >
+          curl --fail --max-time {{ .Values.tests.healthCheck.timeout }}
+          http://{{ include "mistral-server.fullname" . }}:{{ .Values.service.port }}/health
+          || exit 1;
+    - name: inference-test
+      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}"
+      command: ["sh", "-c"]
+      args:
+        - >
+          curl -s --fail --max-time {{ .Values.tests.inference.timeout }}
+          -X POST http://{{ include "mistral-server.fullname" . }}:{{ .Values.service.port }}/infer
+          -d '{"prompt":"{{ .Values.tests.inference.prompt }}"}'
+          || exit 1;
+{{- end }}

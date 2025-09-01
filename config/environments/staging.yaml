@@ -1,0 +1,11 @@
+environment: staging
+
+api:
+  replicas: 2
+  debug: false
+
+torchserve:
+  resources:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
