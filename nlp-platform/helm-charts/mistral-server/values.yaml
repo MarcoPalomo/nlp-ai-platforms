@@ -326,3 +326,6 @@ tests:
     timeout: 120s           # Test d'inférence peut être long
     prompt: "Hello, this is a test."
     expectedTokens: 10
+
+global:
+  namespace: monitoring 
