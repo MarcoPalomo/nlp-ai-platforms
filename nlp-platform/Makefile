@@ -12,8 +12,8 @@ minikube:
 helm:
 	@echo "📦 [helm] Deploying Helm charts..."
 	helm upgrade --install torchserve ./helm-charts/torchserve --values ./helm-charts/torchserve/values.yaml
-	helm upgrade --install mistral ./helm-charts/mistral --values ./helm-charts/mistral/values.yaml
-	helm upgrade --install nlp-api ./helm-charts/nlp-api --values ./helm-charts/nlp-api/values.yaml
+	helm upgrade --install mistral-server ./helm-charts/mistral-server --values ./helm-charts/mistral-server/values.yaml --create-namespace
+	helm upgrade --install api ./helm-charts/api --values ./helm-charts/api/values.yaml
 
 api:
 	@echo "🔌 [api] Forwarding port 8000 for nlp-api service..."
